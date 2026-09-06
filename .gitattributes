@@ -1,0 +1,2 @@
+models/** filter=lfs diff=lfs merge=lfs -text
+servicenow_model_run/output/** filter=lfs diff=lfs merge=lfs -text
