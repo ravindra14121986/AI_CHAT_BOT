@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 import requests
 
@@ -216,6 +216,86 @@ def query_servicenow(
         raise
 
 
+def mutate_servicenow(
+    settings: dict[str, Any],
+    method: str,
+    fields: dict[str, Any],
+    identifier: str | None = None,
+    connection: Any | None = None,
+    user_name: str = "unknown",
+    logging_table: str = "faq_agent_logging",
+) -> dict[str, Any]:
+    """Create or update a ServiceNow record through the Table API.
+
+    ``POST`` creates a record from ``fields``. ``PATCH`` updates one record;
+    incident numbers are resolved to ``sys_id`` before the update because the
+    Table API record endpoint requires a sys_id path segment.
+    """
+    operation = "mutate_servicenow"
+    normalized_method = method.upper()
+    if normalized_method not in {"POST", "PATCH"}:
+        raise ValueError(f"Unsupported mutation method: {method!r}")
+    if not fields:
+        raise ValueError("ServiceNow mutation fields cannot be empty")
+    if normalized_method == "PATCH" and not identifier:
+        raise ValueError("PATCH requires a ServiceNow record identifier")
+
+    try:
+        base_url = urljoin(settings["instance_url"], f"api/now/table/{settings['table']}")
+        target_url = base_url
+        if normalized_method == "PATCH":
+            record_id = identifier
+            if not re.fullmatch(r"[0-9a-fA-F]{32}", identifier or ""):
+                lookup_params = urlencode(
+                    {"sysparm_query": f"number={identifier}", "sysparm_fields": "sys_id", "sysparm_limit": "1"}
+                )
+                lookup_url = f"{base_url}?{lookup_params}"
+                if connection is not None:
+                    log_operation(connection, user_name, f"LOOKUP {operation}: identifier={identifier}", logging_table)
+                lookup_response = requests.get(
+                    lookup_url,
+                    auth=(settings["username"], settings["password"]),
+                    headers={"Accept": "application/json"},
+                    timeout=settings["timeout"],
+                )
+                if not lookup_response.ok:
+                    raise RuntimeError(
+                        f"ServiceNow identifier lookup returned HTTP {lookup_response.status_code}: "
+                        f"{lookup_response.text[:500]}"
+                    )
+                lookup_rows = lookup_response.json().get("result", [])
+                if not lookup_rows:
+                    raise LookupError(f"No ServiceNow record found for identifier {identifier}")
+                record_id = lookup_rows[0].get("sys_id")
+            if not record_id:
+                raise LookupError(f"ServiceNow record has no sys_id for identifier {identifier}")
+            target_url = f"{base_url}/{quote(record_id, safe='')}"
+
+        if connection is not None:
+            log_operation(connection, user_name, f"REQUEST {operation}: method={normalized_method}; fields={fields}", logging_table)
+        response = requests.request(
+            normalized_method,
+            target_url,
+            auth=(settings["username"], settings["password"]),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=fields,
+            timeout=settings["timeout"],
+        )
+        if connection is not None:
+            log_operation(connection, user_name, f"HTTP {operation}: status={response.status_code}", logging_table)
+        if not response.ok:
+            raise RuntimeError(f"ServiceNow returned HTTP {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        result = payload.get("result", payload)
+        if connection is not None:
+            log_success(connection, user_name, operation, f"method={normalized_method}; status={response.status_code}")
+        return result
+    except Exception as error:
+        if connection is not None:
+            log_error(connection, user_name, operation, error)
+        raise
+
+
 def print_output(rows: list[dict[str, Any]]) -> None:
     """Print only the requested ServiceNow output fields as JSON.
 
@@ -235,7 +315,7 @@ def parse_args() -> argparse.Namespace:
         Parsed arguments.
 
     Example:
-        ``python snow_query.py --query "Show high priority incidents"``.
+        ``python faq_snow_query.py --query "Show high priority incidents"``.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--query", required=True, help="User request to resolve through the FAQ table")
@@ -252,7 +332,7 @@ def main() -> int:
         ``0`` on success and ``1`` on a handled failure.
 
     Example:
-        ``python snow_query.py --query "Show me high priority tickets"``.
+        ``python faq_snow_query.py --query "Show me high priority tickets"``.
     """
     args = parse_args()
     connection = None
@@ -260,12 +340,12 @@ def main() -> int:
         db_settings = load_settings(args.db_config)
         snow_settings = load_snow_settings(args.snow_config)
         connection = connect_database(db_settings)
-        log_operation(connection, args.user_name, "START snow_query.main", db_settings.logging_table)
+        log_operation(connection, args.user_name, "START faq_snow_query.main", db_settings.logging_table)
         normalized_query, incident_numbers = normalize_incident_numbers(args.query)
         log_operation(
             connection,
             args.user_name,
-            f"NORMALIZE snow_query.main: query={normalized_query}; incident_count={len(incident_numbers)}",
+            f"NORMALIZE faq_snow_query.main: query={normalized_query}; incident_count={len(incident_numbers)}",
             db_settings.logging_table,
         )
         faq_rows = search_faq(connection, db_settings, normalized_query, 1, args.user_name)
@@ -282,7 +362,7 @@ def main() -> int:
         log_operation(
             connection,
             args.user_name,
-            f"RESTORE snow_query.main: filter={api_filter}; output_column={output_column}",
+            f"RESTORE faq_snow_query.main: filter={api_filter}; output_column={output_column}",
             db_settings.logging_table,
         )
         rows = query_servicenow(
@@ -294,11 +374,11 @@ def main() -> int:
             db_settings.logging_table,
         )
         print_output(rows)
-        log_success(connection, args.user_name, "snow_query.main", f"rows={len(rows)}")
+        log_success(connection, args.user_name, "faq_snow_query.main", f"rows={len(rows)}")
         return 0
     except Exception as error:
         if connection is not None:
-            log_error(connection, getattr(args, "user_name", "unknown"), "snow_query.main", error)
+            log_error(connection, getattr(args, "user_name", "unknown"), "faq_snow_query.main", error)
         print(f"ServiceNow query failed: {error}", file=sys.stderr)
         return 1
     finally:
